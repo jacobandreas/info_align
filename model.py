@@ -13,6 +13,8 @@ class PretrainedModel(nn.Module):
         self.vocab = vocab
 
     def forward(self, inp, out):
+        assert False
+        # TODO BAD REDUCTION
         return self.model(input_ids=inp, labels=out).loss
 
     def decode(self, inp):
@@ -28,11 +30,12 @@ class Model(nn.Module):
         self.pos_embedding = nn.Embedding(N_HIDDEN, N_HIDDEN)
         self.transformer = nn.Transformer(N_HIDDEN, batch_first=True)
         self.pred = nn.Linear(N_HIDDEN, len(vocab))
-        self.loss = nn.CrossEntropyLoss(ignore_index=vocab[utils.PAD])
+        self.loss = nn.CrossEntropyLoss(ignore_index=vocab.PAD, reduction="none")
 
     def forward(self, inp, out):
         out_from = out[:, :-1]
         out_to = out[:, 1:]
+        tgt_shape = out_to.shape
 
         inp_pos = torch.arange(inp.shape[1], device=inp.device)[None, :]
         emb_inp = self.embedding(inp) + self.pos_embedding(inp_pos)
@@ -45,14 +48,16 @@ class Model(nn.Module):
         pred = pred.reshape(-1, len(self.vocab))
         out_to = out_to.reshape(-1)
 
-        loss = self.loss(pred, out_to)
+        loss = self.loss(pred, out_to).view(tgt_shape)
+        loss = loss.sum(dim=1)
         return loss
 
+    @torch.no_grad()
     def decode(self, inp):
         inp_pos = torch.arange(inp.shape[1], device=inp.device)[None, :]
         emb_inp = self.embedding(inp) + self.pos_embedding(inp_pos)
 
-        out = torch.tensor([[self.vocab[utils.START]]] * inp.shape[0]).cuda()
+        out = torch.tensor([[self.vocab.START]] * inp.shape[0]).cuda()
 
         for i in range(20):
             out_pos = torch.arange(out.shape[1], device=out.device)[None, :]
@@ -63,4 +68,10 @@ class Model(nn.Module):
             choice = pred[:, -1:].argmax(dim=2)
             out = torch.cat((out, choice), dim=1)
 
-        return out
+        results = []
+        for row in out:
+            row = row.cpu().numpy().tolist()
+            if self.vocab.END in row:
+                row = row[:row.index(self.vocab.END)+1]
+            results.append(row)
+        return results
