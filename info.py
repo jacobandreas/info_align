@@ -1,6 +1,33 @@
 import numpy as np
 import torch
 
+from model import CountModel
+
+
+# masks a monolingual (source or tgt) seq
+# returns an (inp, out) pair where inp is the input to the model, containing
+# a mask token, and out is the contents of the hole (to be predicted by the
+# model)
+def mask_one(seq, s, p, e, mode, vocab):
+    inp = seq[:s]
+    out = [vocab.HOLE1]
+    if mode == "left":
+        inp += [vocab.HOLE1, vocab.SKIP1]
+        out += seq[s:p]
+    elif mode == "right":
+        inp += [vocab.SKIP1, vocab.HOLE1]
+        out += seq[p:e]
+    else:
+        assert mode == "both"
+        inp += [vocab.HOLE1]
+        out += seq[s:e]
+    inp += seq[e:]
+    inp += [vocab.END]
+    out += [vocab.END]
+    return inp, out
+
+
+# masks a pair of sequences
 def mask(
         src,
         tgt,
@@ -12,7 +39,6 @@ def mask(
         tgt_mode,
         vocab,
 ):
-    #assert not (src_mode == "predict" and tgt_mode == "predict")
     assert vocab.HOLE1 == vocab.START
 
     if src_mode == "ignore":
@@ -45,48 +71,98 @@ def mask(
     return inp, out
 
 
+# computes the log-probability of a given masked (inp, out) pair
+# (i, ii) and (j, jj) are source and target spans respectively; whether they 
+# get masked or predicted is determined by src_mode and tgt_mode (see the `mask`
+# function)
 def cond(src, tgt, i, ii, j, jj, src_mode, tgt_mode, model, vocab):
     inp, out = mask(src, tgt, i, ii, j, jj, src_mode, tgt_mode, vocab)
-    #print()
-    #print("inp ", vocab.decode(inp))
-    #print("gold", vocab.decode(out))
+
+    if isinstance(model, CountModel):
+        return -model(inp, out)
+
     inp = torch.tensor(inp)[None, :].cuda()
     out = torch.tensor(out)[None, :].cuda()
     logprob = -model(inp, out)
-    #print("pred", vocab.decode(model.decode(inp)[0]))
     return logprob.item()
 
 
+# computes the log-probability of a masked monolingual sequence
+def cond_mono(seq, s, p, e, mode, side, model, vocab):
+    inp, out = mask_one(seq, s, p, e, mode, vocab)
+    if isinstance(model, CountModel):
+        if side == "src":
+            return -model.h_src(inp, out)
+        else:
+            assert side == "tgt", side
+            return -model.h_tgt(inp, out)
+    inp = torch.tensor(inp)[None, :].cuda()
+    out = torch.tensor(out)[None, :].cuda()
+    return -model(inp, out)
+
+
+# computes pointwise mutual information between the source span (s0,
+# s1) and the target span (t0, t1) (conditioned on the rest of both sequences)
 def score_spans(src, tgt, s0, s1, t0, t1, model, vocab):
-    #cn = -cond(src, tgt, s0, s1, t0, t1, "predict", "predict", model, vocab)
-    ##cn = 1
-    #c1 = cond(src, tgt, s0, s1, t0, t1, "predict", "ignore", model, vocab)
-    #c2 = cond(src, tgt, s0, s1, t0, t1, "predict", "mask", model, vocab)
-    #pmi_left = (c1 - c2) / cn
-    #c3 = cond(src, tgt, s0, s1, t0, t1, "ignore", "predict", model, vocab)
-    #c4 = cond(src, tgt, s0, s1, t0, t1, "mask", "predict", model, vocab) 
-    #pmi_right = (c3 - c4) / cn
-    #print(vocab.decode(src[s0:s1]), vocab.decode(tgt[t0:t1]))
-    #assert -1.1 <= pmi_left <= 1.1, (c1, c2, cn)
-    #assert -1.1 <= pmi_right <= 1.1, (c3, c4, cn)
-    #print(c1, c2, pmi_left)
-    #print(c3, c4, pmi_right)
-    #print((pmi_left + pmi_right) / 2)
-    #print()
-    #return (pmi_left + pmi_right) / 2
-    #print("\n---")
     joint = cond(src, tgt, s0, s1, t0, t1, "predict", "predict", model, vocab)
     left = cond(src, tgt, s0, s1, t0, t1, "predict", "mask", model, vocab)
     right = cond(src, tgt, s0, s1, t0, t1, "mask", "predict", model, vocab)
-    #assert joint < left, (joint, left)
-    #assert joint < right, (joint, right)
-    #joint = min(joint, left, right)
     left = max(joint, left)
     right = max(joint, right)
-    score = (joint - left - right) / (-joint)
-    assert -1 <= score <= 1, (joint, left, right, score)
+    score = (joint - left - right) / (-joint + 1e-5)
     return score
 
+# computes conditional pointwise mutual information between the monolingual
+# spans (s, p) and (p, e) (conditioned on the rest of the sequence)
+def score_mono(seq, s, p, e, side, model, vocab):
+    left = cond_mono(seq, s, p, e, "left", side, model, vocab)
+    right = cond_mono(seq, s, p, e, "right", side, model, vocab)
+    joint = cond_mono(seq, s, p, e, "both", side, model, vocab) - np.log(e - s + 1)
+    left = max(joint, left)
+    right = max(joint, right)
+    assert joint <= left + 1e-5, (joint, left)
+    assert joint <= right + 1e-5, (joint, right, vocab.decode(seq), s, p, e)
+    #print("sm", joint, left, right)
+    score = (joint - left - right) / (-joint + 1e-5)
+    return score
+
+
+# parses a sentence top-down by repeatedly splitting the source into spans (i,
+# j), (j, k) and the target into spans (i', j'), (j', k') to maximize 
+# pmi(i:j, i':j') + pmi(j:k, j':k') - [ pmi(i:j, j:k) + pmi(i':j', j':k') ]
+def parse_greedy(src, tgt, model, vocab):
+    out = []
+    remaining_spans = [((0, len(src)), (0, len(tgt)), 0)]
+    src_toks = vocab.decode(src)
+    tgt_toks = vocab.decode(tgt)
+    while len(remaining_spans) > 0:
+        (ss, se), (ts, te), curr_span_score = remaining_spans.pop(0)
+        best_score = 0
+        best_split = None
+        for sp in range(ss+1, se):
+            for tp in range(ts+1, te):
+                score_l = score_spans(src, tgt, ss, sp, ts, tp, model, vocab)
+                score_r = score_spans(src, tgt, sp, se, tp, te, model, vocab)
+                score_xs = score_mono(src, ss, sp, se, "src", model, vocab)
+                score_xt = score_mono(tgt, ts, tp, te, "tgt", model, vocab)
+                score = (score_l + score_r) - (score_xs + score_xt)
+                if score > best_score:
+                    best_score = score
+                    best_split = (sp, tp)
+
+        out.append(((ss, se), (ts, te), curr_span_score))
+        if best_split is not None:
+            sp, tp = best_split
+            remaining_spans.append(((ss, sp), (ts, tp), best_score))
+            remaining_spans.append(((sp, se), (tp, te), best_score))
+
+    return out
+
+
+# uses dynamic programming to find the pair of aligned constituency trees that
+# jointly maximize
+# pmi(i:j, i':j') + pmi(j:k, j':k') - [ pmi(i:j, j:k) + pmi(i':j', j':k') ]
+# over all span pairs (i, j), (i', j')
 def parse(src, tgt, model, vocab):
     scores = {}
     for ss in range(len(src)):
@@ -96,12 +172,22 @@ def parse(src, tgt, model, vocab):
                     score = score_spans(src, tgt, ss, se, ts, te, model, vocab)
                     scores[(ss, se), (ts, te)] = score
 
+    scores_src = {}
+    for ss in range(len(src)):
+        for se in range(ss, len(src+1)):
+            for sp in range(ss, se+1):
+                score = score_mono(src, ss, sp, se, "src", model, vocab)
+                scores_src[ss, sp, se] = score
+
+    scores_tgt = {}
+    for ts in range(len(src)):
+        for te in range(ss, len(src+1)):
+            for tp in range(ss, se+1):
+                score = score_mono(tgt, ts, tp, te, "tgt", model, vocab)
+                scores_tgt[ts, tp, te] = score
+
     tree_scores = {}
     pointers = {}
-    #for s in range(len(src)):
-    #    for t in range(len(tgt)):
-    #        tree_scores[(s, s+1), (t, t+1)] = scores[(s, s+1), (t, t+1)]
-    #        pointers[(s, s+1), (t, t+1)] = None
 
     for ss in range(len(src)):
         for se in range(ss+1, len(src)+1):
@@ -115,24 +201,22 @@ def parse(src, tgt, model, vocab):
                 pointers[(s, s+1), (ts, te)] = None
 
     for sl in range(2, len(src)+1):
-        #print("sl=", sl)
         for tl in range(2, len(tgt)+1):
-            #print("tl=", tl)
             for ss in range(len(src)-sl+1):
-                #print("ss=", ss)
                 for ts in range(len(tgt)-tl+1):
-                    #print("ts=", ts)
                     se = ss + sl
                     te = ts + tl
                     best_score = -np.inf
                     best_split = None
                     for sp in range(ss+1, se):
                         for tp in range(ts+1, te):
-                            #print(ss, sp, se, "|", ts, tp, te)
                             score_l = tree_scores[(ss, sp), (ts, tp)]
                             score_r = tree_scores[(sp, se), (tp, te)]
-                            score_h = scores[(ss, se), (ts, te)]
-                            score = score_l + score_r
+                            score = (
+                                score_l + score_r
+                                + scores[(ss, se), (ts, te)]
+                                - (scores_src[ss, sp, se] + scores_tgt[ts, tp, te])
+                            )
                             if score > best_score:
                                 best_score = score
                                 best_split = (sp, tp)
@@ -152,6 +236,8 @@ def parse(src, tgt, model, vocab):
             queue.append(((sp, se), (tp, te)))
     return spans
 
+
+# TODO update & use
 def score_split(src, tgt, si, sj, sk, ti, tj, tk, invert, model, vocab):
     s1s, s1e = si, sj
     s2s, s2e = sj, sk
@@ -179,8 +265,5 @@ def score_split(src, tgt, si, sj, sk, ti, tj, tk, invert, model, vocab):
         - cond(src, tgt, s2s, s2e, t2s, t2e, "mask", "predict", model, vocab)
     )
 
-    #print("s1|t1-s1, t1|s1-t1, s2|t2-s2, t2|s2-t2")
-    #print(pmi_1_left, pmi_1_right, pmi_2_left, pmi_2_right)
     result = (pmi_1_left + pmi_1_right + pmi_2_left + pmi_2_right) / 4
-    #result = max(pmi_1_left, pmi_1_right, pmi_2_left, pmi_2_right)
     return result

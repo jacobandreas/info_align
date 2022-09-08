@@ -1,3 +1,5 @@
+from collections import Counter, defaultdict
+import numpy as np
 import torch
 from torch import nn
 from transformers import MT5ForConditionalGeneration
@@ -6,21 +8,77 @@ import utils
 
 N_HIDDEN = 512
 
+# Estimates (conditional and unconditional) substring probabilities via counting.
+# The `observe` functions increment the frequency of the corresponding event.
+class CountModel:
+    def __init__(self, vocab):
+        self.counts = defaultdict(Counter)
+        self.totals = Counter()
+
+        self.src_counts = defaultdict(Counter)
+        self.src_totals = Counter()
+        self.tgt_counts = defaultdict(Counter)
+        self.tgt_totals = Counter()
+        self.vocab = vocab
+
+    def observe(self, x, y):
+        x = tuple(x)
+        y = tuple(y)
+        self.counts[x][y] += 1
+        self.totals[x] += 1
+
+    def observe_src(self, x, y, scale):
+        x = tuple(x)
+        y = tuple(y)
+        self.src_counts[x][y] += 1. / scale
+        self.src_totals[x] += 1. / scale
+
+    def observe_tgt(self, x, y, scale):
+        x = tuple(x)
+        y = tuple(y)
+        self.tgt_counts[x][y] += 1. / scale
+        self.tgt_totals[x] += 1. / scale
+
+    def h_src(self, x, y):
+        x = tuple(x)
+        y = tuple(y)
+        return -(np.log(self.src_counts[x][y]) - np.log(self.src_totals[x]))
+
+    def h_tgt(self, x, y):
+        x = tuple(x)
+        y = tuple(y)
+        return -(np.log(self.tgt_counts[x][y]) - np.log(self.tgt_totals[x]))
+
+    def train(self):
+        pass
+
+    def eval(self):
+        pass
+
+    def __call__(self, x, y):
+        x = tuple(x)
+        y = tuple(y)
+        return -(np.log(self.counts[x][y]) - np.log(self.totals[x]))
+
+# Estimates substring probabilities by fine-tuning a pre-trained model.
 class PretrainedModel(nn.Module):
     def __init__(self, vocab):
         super().__init__()
         self.model = MT5ForConditionalGeneration.from_pretrained("google/mt5-small")
         self.vocab = vocab
+        self.loss = nn.CrossEntropyLoss(reduction="none")
 
     def forward(self, inp, out):
-        assert False
-        # TODO BAD REDUCTION
-        return self.model(input_ids=inp, labels=out).loss
+        # TODO double-check that this is necessary
+        output = self.model(input_ids=inp, decoder_input_ids=out[:, :-1])
+        logits = output.logits
+        b, l, v = logits.shape
+        return self.loss(logits.view(b*l, v), out[:, :-1].reshape(b*l)).view(b, l).sum(dim=1)
 
     def decode(self, inp):
         return self.model.generate(input_ids=inp, eos_token_id=self.vocab.END)
 
-
+# Estimates substring probabilities by training a transformer from scratch.
 class Model(nn.Module):
     def __init__(self, vocab):
         super().__init__()
@@ -53,7 +111,7 @@ class Model(nn.Module):
         return loss
 
     @torch.no_grad()
-    def decode(self, inp):
+    def decode(self, inp, greedy=True):
         inp_pos = torch.arange(inp.shape[1], device=inp.device)[None, :]
         emb_inp = self.embedding(inp) + self.pos_embedding(inp_pos)
 
@@ -65,7 +123,10 @@ class Model(nn.Module):
             mask = nn.Transformer.generate_square_subsequent_mask(out.shape[1]).cuda()
             enc = self.transformer(emb_inp, emb_out, tgt_mask=mask)
             pred = self.pred(enc)
-            choice = pred[:, -1:].argmax(dim=2)
+            if greedy:
+                choice = pred[:, -1:].argmax(dim=2)
+            else:
+                choice = torch.multinomial(torch.exp(pred[:, -1]), 1)
             out = torch.cat((out, choice), dim=1)
 
         results = []

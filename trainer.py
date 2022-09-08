@@ -1,17 +1,19 @@
+import numpy as np
 import torch
 from torch import optim
-import numpy as np
+from tqdm import tqdm
+import pickle
 
 import info
 import utils
 
 
-N_EPOCH = 1000
-N_ITER = 500
-#N_EPOCH = 50
-#N_ITER = 50
+#N_EPOCH = 500
+#N_ITER = 500
+N_EPOCH = 500
+N_ITER = 200
 
-
+# picks an interval uniformly at random from [1, n]
 def rand_interval(n, random):
     probs = np.arange(n, 0., -1.)
     probs /= probs.sum()
@@ -19,23 +21,28 @@ def rand_interval(n, random):
     end = random.randint(start, n+1)
     return start, end
 
+
+# creates a random masked sequence
 def make_example(src, tgt, random, vocab):
-    pred_src = random.randint(2)
-    #mask_other = random.randint(2)
-    other_action = random.randint(3)
+    if random.randint(2) == 0:
+        return make_bi_example(src, tgt, random, vocab)
+    else:
+        if random.randint(2) == 0:
+            return make_mono_example(src, random, vocab)
+        else:
+            return make_mono_example(tgt, random, vocab)
+
+# creates a random masked bitext sequence
+def make_bi_example(src, tgt, random, vocab):
+    possibilities = set()
+    pred_src = np.random.randint(2)
+    other_action = np.random.randint(3)
     if other_action == 0:
         other_mode = "mask"
     elif other_action == 1:
         other_mode = "ignore"
     elif other_action == 2:
         other_mode = "predict"
-    src_mask_start, src_mask_end = rand_interval(len(src), random)
-    tgt_mask_start, tgt_mask_end = rand_interval(len(tgt), random)
-    #src_mask_start = random.randint(len(src)+1)
-    #src_mask_end = random.randint(src_mask_start, len(src)+1)
-    #tgt_mask_start = random.randint(len(tgt)+1)
-    #tgt_mask_end = random.randint(tgt_mask_start, len(tgt)+1)
-    
     if pred_src:
         src_mode = "predict"
         tgt_mode = other_mode
@@ -43,19 +50,36 @@ def make_example(src, tgt, random, vocab):
         tgt_mode = "predict"
         src_mode = other_mode
 
-    return info.mask(
-        src,
-        tgt,
-        src_mask_start,
-        src_mask_end,
-        tgt_mask_start,
-        tgt_mask_end,
-        src_mode,
-        tgt_mode,
-        vocab,
-    )
+    for i in range(len(src)+1):
+        for ii in range(i, len(src)+1):
+            for j in range(len(tgt)+1):
+                for jj in range(j, len(tgt)+1):
+                        # TODO clean up
+                        for x0, x1 in [(i, ii)]:
+                            for y0, y1 in [(j, jj)]:
+                                if src_mode == "ignore":
+                                    x0, x1 = 0, 0
+                                if tgt_mode == "ignore":
+                                    y0, y1 = 0, 0
+                                possibilities.add((src_mode, tgt_mode, x0, x1, y0, y1))
+    # We build up the `possibilities` set because some maskings can be generated
+    # in multiple ways, but we don't want to double-count them (or joints won't
+    # be compatible with conditionals). TODO we should be able to fix this
+    # analytically, but I was lazy.
+    possibilities = list(possibilities)
+    src_mode, tgt_mode, x0, x1, y0, y1 = possibilities[random.randint(len(possibilities))]
+    return info.mask(src, tgt, x0, x1, y0, y1, src_mode, tgt_mode, vocab)
 
 
+# creates a random masked (source- or target-only) sequence.
+def make_mono_example(seq, random, vocab):
+    s, e = rand_interval(len(seq), random)
+    p = random.randint(s, e+1)
+    mode = random.choice(["left", "right", "both"])
+    return info.mask_one(seq, s, p, e, mode, vocab)
+
+
+# creates a batch of examples for training on
 def make_batch(data, random, vocab, n_batch=32):
     inps = []
     outs = []
@@ -75,25 +99,18 @@ def make_batch(data, random, vocab, n_batch=32):
     return torch.tensor(inps).cuda(), torch.tensor(outs).cuda()
 
 
+# trains a neural model
 def train(model, vocab, data, save_path, random, params):
     random.shuffle(data)
     val_data = data[:500]
     data = data[500:]
-    #val_data = data = data[:10]
-    #keep_data = []
-    #for x, y in data:
-    #    xd = vocab.decode(x)
-    #    if xd.startswith("run") or xd.startswith("sing") or xd.startswith("dance") or xd.startswith("eat"):
-    #        keep_data.append((x, y))
-    #val_data = data = keep_data
-    #print(len(keep_data))
     model.train()
     opt = optim.AdamW(model.parameters(), lr=params["lr"])
     for i in range(N_ITER):
         print(i)
 
         total_loss = 0
-        for j in range(N_EPOCH):
+        for j in tqdm(range(N_EPOCH)):
             batch = make_batch(data, random, vocab, n_batch=params["n_batch"])
             loss = model(*batch).mean()
             opt.zero_grad()
@@ -119,3 +136,62 @@ def train(model, vocab, data, save_path, random, params):
                 print()
 
         torch.save(model.state_dict(), save_path)
+
+
+# trains a count-based model
+def train_count(model, vocab, data, save_path):
+    for src, tgt in tqdm(data):
+        handled = set()
+        for i in range(len(src)+1):
+            for ii in range(i, len(src)+1):
+                for j in range(len(tgt)+1):
+                    for jj in range(j, len(tgt)+1):
+                        for pred_src in range(2):
+                            for other_action in range(3):
+                                if other_action == 0:
+                                    other_mode = "mask"
+                                elif other_action == 1:
+                                    other_mode = "ignore"
+                                elif other_action == 2:
+                                    other_mode = "predict"
+                                if pred_src:
+                                    src_mode = "predict"
+                                    tgt_mode = other_mode
+                                else:
+                                    tgt_mode = "predict"
+                                    src_mode = other_mode
+
+                                # TODO clean up
+                                for x0, x1 in [(i, ii)]:
+                                    for y0, y1 in [(j, jj)]:
+                                        if src_mode == "ignore":
+                                            x0, x1 = 0, 0
+                                        if tgt_mode == "ignore":
+                                            y0, y1 = 0, 0
+                                        sig = (x0, x1, y0, y1, src_mode, tgt_mode)
+                                        if sig in handled:
+                                            continue
+                                        handled.add(sig)
+
+                                        x, y = info.mask(src, tgt, x0, x1, y0, y1, src_mode, tgt_mode, vocab)
+                                        model.observe(x, y)
+
+        # TODO DOUBLE-CHECK THIS
+        # I think we should only count the `both` case once.
+        for i_s in range(len(src)+1):
+            for i_e in range(i_s, len(src)+1):
+                for i_p in range(i_s, i_e+1):
+                    for mode in ["left", "right", "both"]:
+                        x, y = info.mask_one(src, i_s, i_p, i_e, mode, vocab)
+                        model.observe_src(x, y, i_e - i_s + 1)
+        for j_s in range(len(tgt)+1):
+            for j_e in range(j_s, len(tgt)+1):
+                for j_p in range(j_s, j_e+1):
+                    for mode in ["left", "right", "both"]:
+                        x, y = info.mask_one(tgt, j_s, j_p, j_e, mode, vocab)
+                        model.observe_tgt(x, y, j_e - j_s + 1)
+
+    with open(save_path, "wb") as writer:
+        pickle.dump(model, writer)
+
+
