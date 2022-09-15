@@ -8,6 +8,8 @@ from model import Model, PretrainedModel, CountModel
 from trainer import train, train_count
 import info
 import utils
+from visualize import visualize
+
 
 # configuration options
 # task: what task to perform (either lex_trans [word-level translation] or 
