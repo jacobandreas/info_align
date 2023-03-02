@@ -99,25 +99,54 @@ class CountModel:
         y = tuple(y)
         return -(np.log(self.counts[x][y]) - np.log(self.totals[x]))
 
+class LSTMWithAttention(nn.Module):
+    def __init__(self, input_size, hidden_size, n_layers):
+        assert n_layers == 1
+        super().__init__()
+        self.cell = nn.LSTMCell(input_size, hidden_size)
+        self.attention_key = nn.Linear(hidden_size, hidden_size)
+        self.attention_write = nn.Linear(hidden_size, hidden_size)
+
+    def forward(self, src, tgt, state):
+        h, c = state
+        h = h.squeeze(0)
+        c = c.squeeze(0)
+        hiddens = []
+        for i in range(tgt.shape[0]):
+            h, c = self.cell(tgt[i], (h, c))
+            key = self.attention_key(h)
+            scores = (src * key.unsqueeze(0)).sum(dim=1, keepdim=True)
+            weights = scores.softmax(dim=0)
+            pooled = (src * weights).sum(dim=0)
+            h = h + self.attention_write(pooled)
+            hiddens.append(h)
+
+        hiddens = torch.stack(hiddens)
+        h = h.unsqueeze(0)
+        c = c.unsqueeze(0)
+        return hiddens, (h, c)
+
+
 # Ordinary neural sequence model for comparison
 class SequenceModel(nn.Module):
     def __init__(self, vocab):
         super().__init__()
         self.emb = nn.Embedding(len(vocab), 32)
         self.enc = nn.LSTM(32, 256, 1)
-        self.dec = nn.LSTM(32, 256, 1)
+        #self.dec = nn.LSTM(32, 256, 1)
+        self.dec = LSTMWithAttention(32, 256, 1)
         self.pred = nn.Linear(256, len(vocab))
         self.loss = nn.CrossEntropyLoss(ignore_index=vocab.PAD)
         self.vocab = vocab
 
     def sample(self, inp, max_len=20):
         inp_emb = self.emb(inp)
-        _, state = self.enc(inp_emb)
+        inp_enc, state = self.enc(inp_emb)
         n_batch = inp.shape[1]
         out = torch.ones(1, n_batch).long() * self.vocab.START
         for i in range(max_len):
             out_emb = self.emb(out[-1:, :])
-            hiddens, state = self.dec(out_emb, state)
+            hiddens, state = self.dec(inp_enc, out_emb, state)
             pred = self.pred(hiddens).squeeze(0)
             pred = (pred / .1).softmax(dim=1)
             samp = torch.multinomial(pred, num_samples=1)
@@ -139,8 +168,8 @@ class SequenceModel(nn.Module):
         inp_emb = self.emb(inp)
         out_emb = self.emb(out_src)
 
-        _, state = self.enc(inp_emb)
-        hiddens, _ = self.dec(out_emb, state)
+        inp_enc, state = self.enc(inp_emb)
+        hiddens, _ = self.dec(inp_enc, out_emb, state)
         pred = self.pred(hiddens)
 
         pred = pred.view(-1, len(self.vocab))
