@@ -1,8 +1,13 @@
 import numpy as np
 import torch
 from torch import optim
+from torch.utils.data import DataLoader
+from torch.nn.utils.rnn import pad_sequence
 from tqdm import tqdm
 import pickle
+import json
+import bz2
+from model import CountModelEncoder
 
 import info
 import utils
@@ -99,6 +104,45 @@ def make_batch(data, random, vocab, n_batch=32):
     return torch.tensor(inps).cuda(), torch.tensor(outs).cuda()
 
 
+# trains a neural sequence model
+def train_seq(model, vocab, data, save_path, random, params):
+    random.shuffle(data)
+    train_data = data[500:]
+    val_data = data[:500]
+    n_batch = params["n_batch"]
+    def collate(batch):
+        inp, out = zip(*batch)
+        inp = [torch.tensor([vocab.START] + i + [vocab.END]) for i in inp]
+        out = [torch.tensor([vocab.START] + o + [vocab.END]) for o in out]
+        inp_padded = pad_sequence(inp, padding_value=vocab.PAD)
+        out_padded = pad_sequence(out, padding_value=vocab.PAD)
+        return inp_padded, out_padded
+    train_loader = DataLoader(train_data, batch_size=n_batch, shuffle=True, collate_fn=collate)
+    val_loader = DataLoader(val_data, batch_size=n_batch, collate_fn=collate)
+    opt = optim.AdamW(model.parameters(), lr=params["lr"])
+    for i in range(N_ITER):
+        model.train()
+        train_loss = 0
+        for inp, out in train_loader:
+            loss = model(inp, out)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            train_loss += loss.item()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for inp, out in val_loader:
+                loss = model(inp, out)
+                val_loss += loss.item()
+                sample, = model.sample(inp[:, :1])
+                
+                example_inp = inp[:, 0].detach().cpu().numpy().tolist()
+                print(vocab.decode(example_inp), vocab.decode(sample))
+        print(train_loss, val_loss)
+
+
 # trains a neural model
 def train(model, vocab, data, save_path, random, params):
     random.shuffle(data)
@@ -191,7 +235,7 @@ def train_count(model, vocab, data, save_path):
                         x, y = info.mask_one(tgt, j_s, j_p, j_e, mode, vocab)
                         model.observe_tgt(x, y, j_e - j_s + 1)
 
-    with open(save_path, "wb") as writer:
-        pickle.dump(model, writer)
-
-
+    #with open(save_path, "wb") as writer:
+    #    pickle.dump(model, writer)
+    with bz2.open(save_path, "wb") as writer:
+        writer.write(json.dumps(model, cls=CountModelEncoder).encode("utf-8"))
